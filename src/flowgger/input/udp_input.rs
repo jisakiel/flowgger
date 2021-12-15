@@ -5,16 +5,20 @@ use crate::flowgger::encoder::Encoder;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use std::io::{stderr, Read, Write};
 use std::net::SocketAddr;
-use std::net::UdpSocket;
+use nix::sys::uio::IoVec;
+use nix::sys::socket::{AddressFamily, bind, InetAddr, MsgFlags, recvmmsg, RecvMmsgData,
+                       SockAddr, socket, SockType, sockopt::ReusePort};
 use std::str;
 use std::sync::mpsc::SyncSender;
+use nix::libc::{MSG_WAITFORONE};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:514";
 const MAX_UDP_PACKET_SIZE: usize = 65_527;
 const MAX_COMPRESSION_RATIO: usize = 5;
+const RCVMMSG_BATCH_SIZE: usize = 32; // should probably be aligned with number of queues
 
 /// UDP input structure for flowgger
-/// It will receive messages from the network, decode them and reencoded them as configured
+/// It will receive messages from the network, decode them and reencode them as configured
 /// in the [`Config`][] object it takes as input
 ///
 /// [`Config`]: ../config/struct.Config.html
@@ -69,20 +73,49 @@ impl Input for UdpInput {
         decoder: Box<dyn Decoder + Send>,
         encoder: Box<dyn Encoder + Send>,
     ) {
-        let socket = UdpSocket::bind(&self.listen)
-            .unwrap_or_else(|_| panic!("Unable to listen to {}", self.listen));
+        //let socket = UdpSocket::bind(&self.listen)
+        //    .unwrap_or_else(|_| panic!("Unable to listen to {}", self.listen));
+        let inet_addr = InetAddr::from_std(&self.listen);
+        let sock_addr = SockAddr::new_inet(inet_addr);
+        let rsock = socket(AddressFamily::Inet,
+               SockType::Datagram,
+               MSG_WAITFORONE,
+               None
+        ).unwrap();
+        bind(rsock, &sock_addr).unwrap();
+
         let tx = tx.clone();
         let (decoder, encoder): (Box<dyn Decoder>, Box<dyn Encoder>) =
             (decoder.clone_boxed(), encoder.clone_boxed());
-        let mut buf = [0; MAX_UDP_PACKET_SIZE];
+
+        //let mut buf = [0; MAX_UDP_PACKET_SIZE];
+        let mut msgs = std::collections::LinkedList::new();
+
+        // Buffers to receive exactly BATCH_SIZE messages
+        // https://github.com/nix-rust/nix/blob/master/test/sys/test_socket.rs
+        let mut receive_buffers = [[0; MAX_UDP_PACKET_SIZE]; RCVMMSG_BATCH_SIZE];
+        let iovs: Vec<_> = receive_buffers.iter_mut().map(|buf| {
+            [IoVec::from_mut_slice(&mut buf[..])]
+        }).collect();
+
+        for iov in &iovs {
+            msgs.push_back(RecvMmsgData {
+                iov,
+                cmsg_buffer: None,
+            })
+        };
+
+
         loop {
-            let (length, _src) = match socket.recv_from(&mut buf) {
+            let (recvmsgs, _src) = match recvmmsg(rsock, &mut msgs, MsgFlags::MSG_DONTWAIT, None) {
                 Ok(res) => res,
                 Err(_) => continue,
             };
-            let line = &buf[..length];
-            if let Err(e) = handle_record_maybe_compressed(line, &tx, &decoder, &encoder) {
-                let _ = writeln!(stderr(), "{}", e);
+
+            for buf in &receive_buffers {
+                if let Err(e) = handle_record_maybe_compressed(buf, &tx, &decoder, &encoder) {
+                    let _ = writeln!(stderr(), "{}", e);
+                }
             }
         }
     }

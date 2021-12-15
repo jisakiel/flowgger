@@ -1,11 +1,11 @@
-FROM rust:1.38 AS builder
+FROM rust:latest AS builder
 
 WORKDIR /flowgger
 COPY . .
 
 RUN apt-get update && \
-	apt-get install -y capnproto && \
-    cargo build --release && \
+	apt-get install -y capnproto
+RUN cargo build --release && \
     strip target/release/flowgger
 
 
